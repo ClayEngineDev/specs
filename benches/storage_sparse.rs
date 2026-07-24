@@ -38,8 +38,8 @@ macro_rules! gap {
     ($storage:ident, $name:ident => $sparsity:expr) => {
         mod $name {
             use super::{
-                super::{black_box, Bencher, Criterion},
-                setup, CompBool, CompInt,
+                super::{Bencher, Criterion, black_box},
+                CompBool, CompInt, setup,
             };
             use specs::prelude::*;
 

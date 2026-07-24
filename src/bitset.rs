@@ -8,7 +8,7 @@ use hibitset::{AtomicBitSet, BitSet, BitSetAnd, BitSetLike, BitSetNot, BitSetOr,
 
 #[nougat::gat(Type)]
 use crate::join::LendJoin;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 use crate::join::ParJoin;
 use crate::join::{Join, RepeatableLendGet};
 use crate::world::Index;
@@ -62,7 +62,7 @@ macro_rules! define_bit_join {
         // SAFETY: `get` is safe to call concurrently and just returns the
         // provided `id` (`Self::Value` is `()` and corresponds with any mask
         // instance).
-        #[cfg(feature = "parallel")]
+        #[cfg(any(feature = "parallel", feature = "micropool"))]
         unsafe impl<$( $lifetime, )* $( $arg ),*> ParJoin for $bitset
             where $( $arg: BitSetLike ),*
         {

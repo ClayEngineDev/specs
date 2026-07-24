@@ -28,7 +28,7 @@ use shred::{CastFrom, Fetch};
 
 #[nougat::gat(Type)]
 use crate::join::LendJoin;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 use crate::join::ParJoin;
 use crate::{
     error::{Error, WrongGeneration},
@@ -93,7 +93,7 @@ unsafe impl<'a> Join for AntiStorage<'a> {
 // SAFETY: Since `get` does not do anything it is safe to concurrently call.
 // Items are just `()` and it is always safe to retrieve them regardless of the
 // mask and value returned by `open`.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'a> ParJoin for AntiStorage<'a> {
     type Mask = BitSetNot<&'a BitSet>;
     type Type = ();
@@ -533,7 +533,7 @@ where
 // The mask and unprotected storage contained in `MaskedStorage` correspond and
 // `open` returns references to them from the same `MaskedStorage` instance.
 // Iterating the mask does not repeat indices.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'a, 'e, T, D> ParJoin for &'a Storage<'e, T, D>
 where
     T: Component,
@@ -684,7 +684,7 @@ where
 // `open` returns references to them from the same `MaskedStorage` instance (the
 // storage is wrapped in `SharedGetMutOnly`). Iterating the mask does not repeat
 // indices.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'a, 'e, T, D> ParJoin for &'a mut Storage<'e, T, D>
 where
     T: Component,

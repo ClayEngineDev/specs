@@ -368,8 +368,8 @@ fn join_two_components() {
 #[cfg(feature = "parallel")]
 fn par_join_two_components() {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Mutex,
+        atomic::{AtomicBool, Ordering},
     };
     let mut world = create_world();
     world
@@ -431,8 +431,8 @@ fn par_join_two_components() {
 #[cfg(feature = "parallel")]
 fn par_join_with_maybe() {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Mutex,
+        atomic::{AtomicBool, Ordering},
     };
     let mut world = create_world();
     world

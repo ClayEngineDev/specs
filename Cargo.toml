@@ -26,10 +26,12 @@ hibitset = { version = "0.6.4", default-features = false }
 log = "0.4.8"
 shred = { version = "0.16.0", path = "../shred", default-features = false }
 shrev = "1.1.1"
+smallvec = { version = "1.15", optional = true }
 tuple_utils = "0.4.0"
 nougat = "0.2.3"
 
 rayon = { version = "1.5.1", optional = true }
+micropool = { version = "0.2.3", optional = true }
 serde = { version = "1.0.104", optional = true, features = ["serde_derive"] }
 specs-derive = { version = "0.4.1", path = "specs-derive", optional = true }
 uuid = { version = "1.0", optional = true, features = ["v4", "serde"] }
@@ -37,6 +39,7 @@ uuid = { version = "1.0", optional = true, features = ["v4", "serde"] }
 [features]
 default = ["parallel"]
 parallel = ["dep:rayon", "shred/parallel", "hibitset/parallel"]
+micropool = ["dep:micropool", "dep:rayon", "dep:smallvec", "shred/micropool", "hibitset/parallel"]
 uuid_entity = ["dep:uuid", "serde"]
 stdweb = ["dep:uuid", "uuid?/js"]
 storage-event-control = []
@@ -46,7 +49,7 @@ nightly = ["shred/nightly"]
 shred-derive = ["shred/shred-derive"]
 
 [package.metadata.docs.rs]
-features = ["parallel", "serde", "shred-derive", "specs-derive", "uuid_entity", "storage-event-control"]
+features = ["parallel", "micropool", "serde", "shred-derive", "specs-derive", "uuid_entity", "storage-event-control"]
 
 [dev-dependencies]
 nalgebra = "0.32"

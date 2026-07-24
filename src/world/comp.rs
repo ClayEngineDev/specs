@@ -62,10 +62,10 @@ use crate::storage::UnprotectedStorage;
 /// ```
 pub trait Component: Any + Sized {
     /// Associated storage type for this component.
-    #[cfg(feature = "parallel")]
+    #[cfg(any(feature = "parallel", feature = "micropool"))]
     type Storage: UnprotectedStorage<Self> + Any + Send + Sync;
 
     /// Associated storage type for this component.
-    #[cfg(not(feature = "parallel"))]
+    #[cfg(not(any(feature = "parallel", feature = "micropool")))]
     type Storage: UnprotectedStorage<Self> + Any;
 }

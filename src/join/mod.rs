@@ -9,7 +9,7 @@ use crate::world::Index;
 mod bit_and;
 mod lend_join;
 mod maybe;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 mod par_join;
 
 pub use bit_and::BitAnd;
@@ -17,8 +17,12 @@ pub use bit_and::BitAnd;
 pub use lend_join::LendJoin;
 pub use lend_join::{JoinLendIter, LendJoinType, RepeatableLendGet};
 pub use maybe::MaybeJoin;
+#[cfg(feature = "micropool")]
+pub use par_join::{JoinMicropoolIter, JoinMicropoolIterWithPool, ParJoinCache};
 #[cfg(feature = "parallel")]
-pub use par_join::{JoinParIter, ParJoin};
+pub use par_join::JoinParIter;
+#[cfg(any(feature = "parallel", feature = "micropool"))]
+pub use par_join::ParJoin;
 
 /// The purpose of the `Join` trait is to provide a way
 /// to access multiple storages at the same time with
@@ -295,7 +299,7 @@ macro_rules! define_open {
         // from each type in this tuple. So if an `id` is present in the
         // combined mask, it will be safe to retrieve the corresponding items.
         // Iterating the mask does not repeat indices.
-        #[cfg(feature = "parallel")]
+        #[cfg(any(feature = "parallel", feature = "micropool"))]
         unsafe impl<$($from,)*> ParJoin for ($($from),*,)
             where $($from: ParJoin),*,
                   ($(<$from as ParJoin>::Mask,)*): BitAnd,
@@ -449,7 +453,7 @@ macro_rules! immutable_resource_join {
         // SAFETY: Since `T` implements `ParJoin` it is safe to deref and defer to
         // its implementation. S-TODO we can rely on errors if $ty is not sync?
         // Iterating the mask does not repeat indices.
-        #[cfg(feature = "parallel")]
+        #[cfg(any(feature = "parallel", feature = "micropool"))]
         unsafe impl<'a, 'b, T> ParJoin for &'a $ty
         where
             &'a T: ParJoin,
@@ -568,7 +572,7 @@ macro_rules! mutable_resource_join {
 
         // SAFETY: Since `T` implements `ParJoin` it is safe to deref and defer
         // its implementation. S-TODO we can rely on errors if $ty is not sync?
-        #[cfg(feature = "parallel")]
+        #[cfg(any(feature = "parallel", feature = "micropool"))]
         unsafe impl<'a, 'b, T> ParJoin for &'a mut $ty
         where
             &'a mut T: ParJoin,

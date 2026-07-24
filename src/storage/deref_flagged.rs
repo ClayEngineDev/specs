@@ -58,8 +58,10 @@ where
 }
 
 impl<C: Component, T: UnprotectedStorage<C>> UnprotectedStorage<C> for DerefFlaggedStorage<C, T> {
-    type AccessMut<'a> = FlaggedAccessMut<'a, <T as UnprotectedStorage<C>>::AccessMut<'a>, C>
-        where T: 'a;
+    type AccessMut<'a>
+        = FlaggedAccessMut<'a, <T as UnprotectedStorage<C>>::AccessMut<'a>, C>
+    where
+        T: 'a;
 
     unsafe fn clean<B>(&mut self, has: B)
     where

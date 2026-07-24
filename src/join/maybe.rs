@@ -1,6 +1,6 @@
 #[nougat::gat(Type)]
 use super::LendJoin;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 use super::ParJoin;
 use super::{Join, RepeatableLendGet};
 use hibitset::{BitSetAll, BitSetLike};
@@ -99,7 +99,7 @@ where
 //
 // We return a mask containing all items, but check the original mask in
 // the `get` implementation. Iterating the mask does not repeat indices.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<T> ParJoin for MaybeJoin<T>
 where
     T: ParJoin,

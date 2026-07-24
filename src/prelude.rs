@@ -5,7 +5,7 @@
 pub use crate::join::Join;
 #[nougat::gat(Type)]
 pub use crate::join::LendJoin;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 pub use crate::join::ParJoin;
 pub use hibitset::BitSet;
 pub use shred::{
@@ -14,9 +14,13 @@ pub use shred::{
 };
 pub use shrev::ReaderId;
 
+#[cfg(feature = "micropool")]
+pub use micropool::iter::ParallelIteratorExt as MicropoolParallelIterator;
+#[cfg(feature = "micropool")]
+pub use crate::join::ParJoinCache;
 #[cfg(feature = "parallel")]
 pub use rayon::iter::ParallelIterator;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 pub use shred::AsyncDispatcher;
 
 pub use crate::{

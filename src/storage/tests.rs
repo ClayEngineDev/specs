@@ -765,6 +765,154 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "micropool")]
+    fn micropool_storage_join_uses_current_and_explicit_pools() {
+        use crate::{MicropoolParallelIterator, ParJoinCache, join::ParJoin};
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        world.register::<Cvec>();
+        let mut storage: Storage<Cvec, _> = world.write_storage();
+
+        // Use the same object count as the UIImage preparation regression.
+        for i in 0..100 {
+            if let Err(err) = storage.insert(Entity::new(i, Generation::new(1)), (i + 10).into()) {
+                panic!("Failed to insert component into entity! {:?}", err);
+            }
+        }
+
+        let current_pool_sum = AtomicUsize::new(0);
+        (&storage).micropool_join().for_each(|component| {
+            current_pool_sum.fetch_add(component.0 as usize, Ordering::Relaxed);
+        });
+        assert_eq!(current_pool_sum.load(Ordering::Relaxed), 5950);
+
+        let mut cache = ParJoinCache::new();
+        for _ in 0..2 {
+            let cached_pool_sum = AtomicUsize::new(0);
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .for_each(|component| {
+                    cached_pool_sum.fetch_add(component.0 as usize, Ordering::Relaxed);
+                });
+            assert_eq!(cached_pool_sum.load(Ordering::Relaxed), 5950);
+        }
+
+        let per_item_sum = AtomicUsize::new(0);
+        (&storage)
+            .micropool_join_with_cache(&mut cache)
+            .split_per_item()
+            .for_each(|component| {
+                per_item_sum.fetch_add(component.0 as usize, Ordering::Relaxed);
+            });
+        assert_eq!(per_item_sum.load(Ordering::Relaxed), 5950);
+
+        assert_eq!(
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .split_per(7)
+                .map(|component| component.0 as usize)
+                .sum::<usize>(),
+            5950
+        );
+        assert_eq!(
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .split_by(256)
+                .map(|component| component.0 as usize)
+                .sum::<usize>(),
+            5950
+        );
+        assert_eq!(
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .split_by_threads()
+                .map(|component| component.0 as usize)
+                .sum::<usize>(),
+            5950
+        );
+        assert_eq!(
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .with_thread_pool(micropool::split_per_item())
+                .map(|component| component.0 as usize)
+                .sum::<usize>(),
+            5950
+        );
+
+        let serial_threads = Mutex::new(HashSet::new());
+        (&storage)
+            .micropool_join()
+            .with_max_parallelism(1)
+            .for_each(|_| {
+                serial_threads
+                    .lock()
+                    .unwrap()
+                    .insert(std::thread::current().id());
+            });
+        assert_eq!(
+            serial_threads.lock().unwrap().len(),
+            1,
+            "max parallelism of one must keep the join sequential"
+        );
+
+        let capped_threads = Mutex::new(HashSet::new());
+        (&storage)
+            .micropool_join()
+            .with_max_parallelism(2)
+            .with_min_items_per_work_unit(1)
+            .for_each(|_| {
+                capped_threads
+                    .lock()
+                    .unwrap()
+                    .insert(std::thread::current().id());
+            });
+        let capped_thread_count = capped_threads.lock().unwrap().len();
+        assert!(
+            capped_thread_count <= 2,
+            "join exceeded its configured maximum parallelism"
+        );
+
+        assert_eq!(
+            (&storage)
+                .micropool_join_with_cache(&mut cache)
+                .with_max_parallelism(2)
+                .map(|component| component.0 as usize)
+                .sum::<usize>(),
+            5950
+        );
+
+        // Match the ECS case: the System itself is already executing on a
+        // global micropool worker when it starts the component join.
+        let nested_pool_count = AtomicUsize::new(0);
+        let (finished_sender, finished_receiver) = std::sync::mpsc::sync_channel(0);
+        micropool::join(
+            move || finished_receiver.recv().unwrap(),
+            || {
+                (&storage).micropool_join().for_each(|_| {
+                    nested_pool_count.fetch_add(1, Ordering::Relaxed);
+                });
+                finished_sender.send(()).unwrap();
+            },
+        );
+        assert_eq!(nested_pool_count.load(Ordering::Relaxed), 100);
+
+        let pool = micropool::ThreadPoolBuilder::default()
+            .num_threads(2)
+            .build();
+        let explicit_pool_count = AtomicUsize::new(0);
+        (&storage)
+            .micropool_join_with(&pool)
+            .split_per_item()
+            .for_each(|_| {
+                explicit_pool_count.fetch_add(1, Ordering::Relaxed);
+            });
+        assert_eq!(explicit_pool_count.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
     fn storage_entry() {
         let mut w = World::new();
         w.register::<Cvec>();

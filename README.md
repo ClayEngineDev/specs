@@ -33,6 +33,11 @@ Unlike most other ECS libraries out there, it provides
 
 Minimum Rust version: 1.70
 
+The optional `micropool` feature requires Rust 1.85 or newer. It adds
+`ParJoin::micropool_join` and `ParJoin::micropool_join_with`, and enables
+micropool-backed `System` dispatching in Shred. The existing Rayon-backed
+`parallel` feature remains available independently.
+
 ## [Link to the book][book]
 
 [book]: https://amethyst.github.io/specs/docs/tutorials/
@@ -115,6 +120,7 @@ Please look into [the examples directory](examples) for more.
 | crate    | version                                                                                        |
 |----------|------------------------------------------------------------------------------------------------|
 | hibitset | [![hibitset](https://img.shields.io/crates/v/hibitset.svg)](https://crates.io/crates/hibitset) |
+| micropool | [![micropool](https://img.shields.io/crates/v/micropool.svg)](https://crates.io/crates/micropool) |
 | rayon    | [![rayon](https://img.shields.io/crates/v/rayon.svg)](https://crates.io/crates/rayon)          |
 | shred    | [![shred](https://img.shields.io/crates/v/shred.svg)](https://crates.io/crates/shred)          |
 | shrev    | [![shrev](https://img.shields.io/crates/v/shrev.svg)](https://crates.io/crates/shrev)          |

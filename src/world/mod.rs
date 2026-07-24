@@ -50,7 +50,7 @@ pub trait Builder {
     ///
     /// Panics if the component hasn't been `register()`ed in the
     /// `World`.
-    #[cfg(feature = "parallel")]
+    #[cfg(any(feature = "parallel", feature = "micropool"))]
     fn with<C: Component + Send + Sync>(self, c: C) -> Self;
 
     /// Appends a component and associates it with the entity.
@@ -62,7 +62,7 @@ pub trait Builder {
     ///
     /// Panics if the component hasn't been `register()`ed in the
     /// `World`.
-    #[cfg(not(feature = "parallel"))]
+    #[cfg(not(any(feature = "parallel", feature = "micropool")))]
     fn with<C: Component>(self, c: C) -> Self;
 
     /// Convenience method that calls `self.with(component)` if
@@ -72,7 +72,7 @@ pub trait Builder {
     ///
     /// Panics if the component hasn't been `register()`ed in the
     /// `World`.
-    #[cfg(feature = "parallel")]
+    #[cfg(any(feature = "parallel", feature = "micropool"))]
     fn maybe_with<C: Component + Send + Sync>(self, c: Option<C>) -> Self
     where
         Self: Sized,
@@ -90,7 +90,7 @@ pub trait Builder {
     ///
     /// Panics if the component hasn't been `register()`ed in the
     /// `World`.
-    #[cfg(not(feature = "parallel"))]
+    #[cfg(not(any(feature = "parallel", feature = "micropool")))]
     fn maybe_with<C: Component>(self, c: Option<C>) -> Self
     where
         Self: Sized,

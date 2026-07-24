@@ -10,8 +10,8 @@ use serde::de::{
 use super::ConvertSaveload;
 use crate::{
     saveload::{
-        marker::{Marker, MarkerAllocator},
         EntityData,
+        marker::{Marker, MarkerAllocator},
     },
     storage::{GenericWriteStorage, WriteStorage},
     world::{Component, EntitiesRes, Entity},

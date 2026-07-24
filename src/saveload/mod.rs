@@ -25,7 +25,7 @@
 
 use std::convert::Infallible;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::world::Entity;
 

@@ -11,7 +11,7 @@ use shred::Fetch;
 use crate::join::LendJoin;
 use crate::join::{Join, RepeatableLendGet};
 
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 use crate::join::ParJoin;
 use crate::{
     storage::{
@@ -356,7 +356,7 @@ where
 // in the wrapped `Storage`.
 //
 // Iterating the mask does not repeat indices.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'rf, C, S> ParJoin for &'rf RestrictedStorage<'rf, C, S>
 where
     C: Component,
@@ -395,7 +395,7 @@ where
 // in the wrapped `Storage`.
 //
 // Iterating the mask does not repeat indices.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'rf, C, S> ParJoin for &'rf mut RestrictedStorage<'rf, C, S>
 where
     C: Component,

@@ -9,7 +9,7 @@ use shred::Read;
 
 #[nougat::gat(Type)]
 use crate::join::LendJoin;
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 use crate::join::ParJoin;
 use crate::{
     error::WrongGeneration,
@@ -372,7 +372,7 @@ unsafe impl<'a> Join for &'a EntitiesRes {
 // threads at once.
 //
 // It is safe to retrieve elements with any `id` regardless of the mask.
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 unsafe impl<'a> ParJoin for &'a EntitiesRes {
     type Mask = BitSetOr<&'a BitSet, &'a AtomicBitSet>;
     type Type = Entity;

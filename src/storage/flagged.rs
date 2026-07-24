@@ -203,7 +203,10 @@ where
 }
 
 impl<C: Component, T: UnprotectedStorage<C>> UnprotectedStorage<C> for FlaggedStorage<C, T> {
-    type AccessMut<'a> = <T as UnprotectedStorage<C>>::AccessMut<'a> where T: 'a;
+    type AccessMut<'a>
+        = <T as UnprotectedStorage<C>>::AccessMut<'a>
+    where
+        T: 'a;
 
     unsafe fn clean<B>(&mut self, has: B)
     where

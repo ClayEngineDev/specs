@@ -116,8 +116,10 @@ impl<'a, T> GenericWriteStorage for WriteStorage<'a, T>
 where
     T: Component,
 {
-    type AccessMut<'b> = <<T as Component>::Storage as UnprotectedStorage<T>>::AccessMut<'b>
-        where Self: 'b;
+    type AccessMut<'b>
+        = <<T as Component>::Storage as UnprotectedStorage<T>>::AccessMut<'b>
+    where
+        Self: 'b;
     type Component = T;
 
     fn get_mut(&mut self, entity: Entity) -> Option<AccessMutReturn<'_, T>> {
@@ -154,8 +156,10 @@ impl<'a: 'b, 'b, T> GenericWriteStorage for &'b mut WriteStorage<'a, T>
 where
     T: Component,
 {
-    type AccessMut<'c> = <<T as Component>::Storage as UnprotectedStorage<T>>::AccessMut<'c>
-        where Self: 'c;
+    type AccessMut<'c>
+        = <<T as Component>::Storage as UnprotectedStorage<T>>::AccessMut<'c>
+    where
+        Self: 'c;
     type Component = T;
 
     fn get_mut(&mut self, entity: Entity) -> Option<AccessMutReturn<'_, T>> {

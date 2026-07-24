@@ -63,8 +63,8 @@
 //!
 //! These storages can be [`join`]ed together, for example joining a `Velocity`
 //! and a `Position` storage means you'll only get entities which have both of
-//! them. Thanks to rayon, this is even possible in parallel! See [`ParJoin`]
-//! for more.
+//! them. With the `parallel` or `micropool` feature, this is also possible in
+//! parallel. See [`ParJoin`] for more.
 //!
 //! [`join`]: trait.Join.html#method.join
 //! [`ParJoin`]: trait.ParJoin.html
@@ -188,6 +188,8 @@
 //! See the repository's examples directory for more examples.
 
 pub extern crate hibitset;
+#[cfg(feature = "micropool")]
+pub extern crate micropool;
 #[cfg(feature = "parallel")]
 pub extern crate rayon;
 pub extern crate shred;
@@ -214,14 +216,16 @@ pub use shred::{
 };
 pub use shrev::ReaderId;
 
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 pub use shred::AsyncDispatcher;
 
 #[cfg(feature = "specs-derive")]
 pub use specs_derive::{Component, ConvertSaveload};
 
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 pub use crate::join::ParJoin;
+#[cfg(feature = "micropool")]
+pub use crate::join::ParJoinCache;
 pub use crate::{
     changeset::ChangeSet,
     join::{Join, LendJoin},
@@ -231,5 +235,7 @@ pub use crate::{
     },
     world::{Builder, Component, Entities, Entity, EntityBuilder, LazyUpdate, WorldExt},
 };
+#[cfg(feature = "micropool")]
+pub use micropool::iter::ParallelIteratorExt as MicropoolParallelIterator;
 
 pub use crate::storage::DerefFlaggedStorage;

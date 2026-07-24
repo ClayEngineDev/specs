@@ -6,8 +6,8 @@ use super::ConvertSaveload;
 use crate::{
     join::Join,
     saveload::{
-        marker::{Marker, MarkerAllocator},
         EntityData,
+        marker::{Marker, MarkerAllocator},
     },
     storage::{GenericReadStorage, ReadStorage, WriteStorage},
     world::{Component, EntitiesRes, Entity},

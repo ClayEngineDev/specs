@@ -11,29 +11,29 @@ impl<T> Default for Queue<T> {
     }
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 pub trait LazyUpdateInternal: Send + Sync {
     fn update(self: Box<Self>, world: &mut World);
 }
 
-#[cfg(not(feature = "parallel"))]
+#[cfg(not(any(feature = "parallel", feature = "micropool")))]
 pub trait LazyUpdateInternal {
     fn update(self: Box<Self>, world: &mut World);
 }
 
 /// Generates two versions of functions within the macro call:
 ///
-/// * One with `Send + Sync` bounds when the `"parallel"` feature is enabled.
-/// * One without `Send + Sync` bounds when the `"parallel"` feature is
-///   disabled.
+/// * One with `Send + Sync` bounds when the `"parallel"` or `"micropool"`
+///   feature is enabled.
+/// * One without `Send + Sync` bounds when neither parallel backend is enabled.
 ///
 /// TODO: When trait aliases land on stable we can remove this macro.
 /// See <https://github.com/rust-lang/rust/issues/41517>.
 ///
 /// ```rust,ignore
-/// #![cfg(feature = "parallel")]
+/// #![cfg(any(feature = "parallel", feature = "micropool"))]
 /// trait ComponentBound = Component + Send + Sync;
-/// #![cfg(not(feature = "parallel"))]
+/// #![cfg(not(any(feature = "parallel", feature = "micropool")))]
 /// trait ComponentBound = Component;
 /// ```
 ///
@@ -53,7 +53,7 @@ macro_rules! parallel_feature {
     {
         $(
             $(#[$attrs])*
-            #[cfg(feature = "parallel")]
+            #[cfg(any(feature = "parallel", feature = "micropool"))]
             $($words)+<$($ty_params),+> $args $(-> $return_ty)?
             where
                 $($ty_param:
@@ -63,7 +63,7 @@ macro_rules! parallel_feature {
             $body
 
             $(#[$attrs])*
-            #[cfg(not(feature = "parallel"))]
+            #[cfg(not(any(feature = "parallel", feature = "micropool")))]
             $($words)+<$($ty_params),+> $args $(-> $return_ty)?
             where
                 $($ty_param:
@@ -119,7 +119,7 @@ impl<'a> Builder for LazyBuilder<'a> {
     }
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "parallel", feature = "micropool"))]
 impl<F> LazyUpdateInternal for F
 where
     F: FnOnce(&mut World) + Send + Sync + 'static,
@@ -129,7 +129,7 @@ where
     }
 }
 
-#[cfg(not(feature = "parallel"))]
+#[cfg(not(any(feature = "parallel", feature = "micropool")))]
 impl<F> LazyUpdateInternal for F
 where
     F: FnOnce(&mut World) + 'static,

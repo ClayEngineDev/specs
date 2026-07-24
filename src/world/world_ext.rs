@@ -1,13 +1,13 @@
 use super::{
+    CreateIter, EntityBuilder, LazyUpdate,
     comp::Component,
     entity::{Allocator, EntitiesRes, Entity},
-    CreateIter, EntityBuilder, LazyUpdate,
 };
 
 use crate::{
+    ReadStorage, WriteStorage,
     error::WrongGeneration,
     storage::{AnyStorage, MaskedStorage},
-    ReadStorage, WriteStorage,
 };
 use shred::{Fetch, FetchMut, MetaTable, Read, Resource, SystemData, World};
 

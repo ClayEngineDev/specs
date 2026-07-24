@@ -3,7 +3,7 @@ use rand::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::iter::ParallelIterator;
 
-use specs::{prelude::*, storage::HashMapStorage, WorldExt};
+use specs::{WorldExt, prelude::*, storage::HashMapStorage};
 
 const TAU: f32 = 2. * std::f32::consts::PI;
 
