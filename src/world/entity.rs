@@ -268,6 +268,18 @@ pub struct EntitiesRes {
 }
 
 impl EntitiesRes {
+    /// Returns an exclusive upper bound for entity indices allocated by this
+    /// resource.
+    ///
+    /// The bound is a high-water mark: it includes indices pending
+    /// [`World::maintain`](crate::World::maintain), and it does not shrink
+    /// after entities are deleted. It can be used to bound operations that
+    /// would otherwise scan hibitset's entire index space.
+    #[inline]
+    pub fn index_bound(&self) -> usize {
+        self.alloc.max_id.load(Ordering::Relaxed)
+    }
+
     /// Creates a new entity atomically.
     /// This will be persistent as soon
     /// as you call `World::maintain`.

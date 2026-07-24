@@ -14,6 +14,28 @@ impl Component for Vel {
 }
 
 #[test]
+fn entity_index_bound_tracks_allocation_high_water_mark() {
+    let mut world = World::new();
+    assert_eq!(world.entities().index_bound(), 0);
+
+    let first = world.create_entity().build();
+    assert_eq!(first.id(), 0);
+    assert_eq!(world.entities().index_bound(), 1);
+
+    let second = world.entities().create();
+    assert_eq!(second.id(), 1);
+    assert_eq!(world.entities().index_bound(), 2);
+
+    world.maintain();
+    world.delete_entity(first).unwrap();
+    assert_eq!(world.entities().index_bound(), 2);
+
+    let reused = world.create_entity().build();
+    assert_eq!(reused.id(), first.id());
+    assert_eq!(world.entities().index_bound(), 2);
+}
+
+#[test]
 fn delete_all() {
     let mut world = World::new();
 

@@ -4,8 +4,9 @@ use hibitset::BitSetLike;
 #[cfg(feature = "micropool")]
 use micropool::iter::{
     Accumulator, ExactParallelSourceExt, ExactSizeAccumulator, GenericThreadPool,
-    IntoExactParallelRefSource, ParallelIterator as MicropoolParallelIterator,
-    ParallelIteratorExt as MicropoolParallelIteratorExt,
+    IntoExactParallelRefSource, IntoExactParallelSource,
+    ParallelIterator as MicropoolParallelIterator,
+    ParallelIteratorExt as MicropoolParallelIteratorExt, ParallelSourceExt,
 };
 #[cfg(feature = "parallel")]
 use rayon::iter::plumbing::UnindexedProducer;
@@ -20,12 +21,22 @@ use smallvec::SmallVec;
 use std::num::NonZeroUsize;
 #[cfg(feature = "micropool")]
 use std::ops::ControlFlow;
+#[cfg(feature = "micropool")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::world::Index;
 
 #[cfg(feature = "micropool")]
 const DEFAULT_MIN_ITEMS_PER_WORK_UNIT: NonZeroUsize =
     NonZeroUsize::new(1).expect("default micropool work-unit size must be non-zero");
+
+// `hibitset` has four hierarchy levels with one machine word per level.
+// Its maximum index count is therefore `usize::BITS.pow(4)`.
+#[cfg(feature = "micropool")]
+const HIBITSET_INDEX_COUNT: usize = hibitset::BitSet::BITS_PER_USIZE.pow(4);
+
+#[cfg(feature = "micropool")]
+static WARNED_UNCONSTRAINED_MICROPOOL_JOIN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "micropool")]
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +65,9 @@ impl Default for MicropoolSplit {
 ///
 /// The first 32 indices are stored inline. Larger joins retain their heap
 /// allocation for subsequent runs, making this suitable for storage directly
-/// on an ECS `System`.
+/// on an ECS `System`. Unconstrained joins (for example, a tuple containing
+/// only `MaybeJoin`s) bypass this cache and use a range source without
+/// materializing the full index array.
 #[cfg(feature = "micropool")]
 #[derive(Debug, Default)]
 pub struct ParJoinCache {
@@ -123,9 +136,9 @@ pub unsafe trait ParJoin {
     where
         Self: Sized,
     {
-        warn_if_unconstrained::<Self>("MicropoolJoin");
         JoinMicropoolIter {
             cache: None,
+            index_bound: None,
             join: self,
             pool: None,
             split: MicropoolSplit::default(),
@@ -141,9 +154,9 @@ pub unsafe trait ParJoin {
     where
         Self: Sized,
     {
-        warn_if_unconstrained::<Self>("MicropoolJoin");
         JoinMicropoolIter {
             cache: None,
+            index_bound: None,
             join: self,
             pool: Some(pool),
             split: MicropoolSplit::default(),
@@ -160,9 +173,9 @@ pub unsafe trait ParJoin {
     where
         Self: Sized,
     {
-        warn_if_unconstrained::<Self>("MicropoolJoin");
         JoinMicropoolIter {
             cache: Some(cache),
+            index_bound: None,
             join: self,
             pool: None,
             split: MicropoolSplit::default(),
@@ -288,25 +301,41 @@ where
 }
 
 #[cfg(feature = "micropool")]
-fn warn_if_unconstrained<J: ParJoin>(iterator_name: &str) {
-    if J::is_unconstrained() {
+fn warn_if_unconstrained<J: ParJoin>(index_bound: usize) {
+    if !WARNED_UNCONSTRAINED_MICROPOOL_JOIN.swap(true, Ordering::Relaxed) {
+        let join_type = std::any::type_name::<J>();
         log::warn!(
-            "`{iterator_name}` possibly iterating through all indices, \
-            you might've made a join with all `MaybeJoin`s, \
-            which is unbounded in length."
+            "`MicropoolJoin<{join_type}>` has no bounded join member, possibly \
+            because every member is a `MaybeJoin`. Micropool will scan \
+            {index_bound} candidate indices without materializing them; use \
+            `with_index_bound` with `EntitiesRes::index_bound`, or add a \
+            bounded join member."
         );
     }
 }
 
+#[cfg(feature = "micropool")]
+#[inline]
+fn unconstrained_index_bound<J: ParJoin>(index_bound: Option<usize>) -> usize {
+    let index_bound = index_bound
+        .unwrap_or(HIBITSET_INDEX_COUNT)
+        .min(HIBITSET_INDEX_COUNT);
+    warn_if_unconstrained::<J>(index_bound);
+    index_bound
+}
+
 /// A micropool parallel iterator over a group of storages.
 ///
-/// Entity indices are materialized before dispatch because micropool's
+/// Bounded entity indices are materialized before dispatch because micropool's
 /// parallel-iterator backend operates on indexed sources. Joined component
-/// values are still fetched lazily on worker threads.
+/// values are still fetched lazily on worker threads. Unconstrained masks are
+/// streamed over hibitset's finite index range instead, avoiding a 64 MiB
+/// index allocation on 64-bit targets.
 #[cfg(feature = "micropool")]
 #[must_use = "iterator adaptors are lazy"]
 pub struct JoinMicropoolIter<'pool, J> {
     cache: Option<&'pool mut ParJoinCache>,
+    index_bound: Option<usize>,
     join: J,
     pool: Option<&'pool micropool::ThreadPool>,
     split: MicropoolSplit,
@@ -388,12 +417,31 @@ where
         self
     }
 
+    /// Bounds an unconstrained join to candidate indices in
+    /// `0..index_bound`.
+    ///
+    /// Use [`EntitiesRes::index_bound`](crate::world::EntitiesRes::index_bound)
+    /// to replace hibitset's full 32/64-bit-dependent index space with the
+    /// current world's entity-allocation high-water mark. The value is a
+    /// snapshot and is clamped to hibitset's maximum supported index count.
+    ///
+    /// This setting has no effect on a join with at least one bounded member;
+    /// those joins continue to iterate their merged mask through
+    /// [`ParJoinCache`].
+    #[must_use]
+    pub fn with_index_bound(mut self, index_bound: usize) -> Self {
+        self.index_bound = Some(index_bound.min(HIBITSET_INDEX_COUNT));
+        self
+    }
+
     /// Uses micropool's native `split_per_item` strategy.
     ///
     /// Every joined entity becomes a separate work unit. This maximizes steal
     /// opportunities for a small number of expensive or uneven tasks, but it
-    /// also maximizes scheduling overhead. Selecting any `split_*` strategy
-    /// replaces the adaptive `with_*` settings.
+    /// also maximizes scheduling overhead and per-work-unit terminal storage.
+    /// Bound an unconstrained join before selecting this strategy; otherwise
+    /// the work-unit count is hibitset's entire index space. Selecting any
+    /// `split_*` strategy replaces the adaptive `with_*` settings.
     #[must_use]
     pub fn split_per_item(mut self) -> Self {
         self.split = MicropoolSplit::PerItem;
@@ -452,6 +500,7 @@ where
     {
         JoinMicropoolIterWithPool {
             cache: self.cache,
+            index_bound: self.index_bound,
             join: self.join,
             thread_pool,
         }
@@ -466,7 +515,14 @@ where
     where
         F: Fn(J::Type) + Sync,
     {
-        run_micropool_for_each(self.join, self.pool, self.cache, self.split, f);
+        run_micropool_for_each(
+            self.join,
+            self.pool,
+            self.cache,
+            self.index_bound,
+            self.split,
+            f,
+        );
     }
 }
 
@@ -475,6 +531,7 @@ where
 #[must_use = "iterator adaptors are lazy"]
 pub struct JoinMicropoolIterWithPool<'cache, J, P> {
     cache: Option<&'cache mut ParJoinCache>,
+    index_bound: Option<usize>,
     join: J,
     thread_pool: P,
 }
@@ -487,13 +544,31 @@ where
     J::Value: Send + Sync,
     P: GenericThreadPool,
 {
+    /// Bounds an unconstrained join to candidate indices in
+    /// `0..index_bound`.
+    ///
+    /// This is equivalent to calling
+    /// [`JoinMicropoolIter::with_index_bound`] before
+    /// [`JoinMicropoolIter::with_thread_pool`].
+    #[must_use]
+    pub fn with_index_bound(mut self, index_bound: usize) -> Self {
+        self.index_bound = Some(index_bound.min(HIBITSET_INDEX_COUNT));
+        self
+    }
+
     /// Runs `f` using the concrete micropool strategy supplied by
     /// [`JoinMicropoolIter::with_thread_pool`].
     pub fn for_each<F>(self, f: F)
     where
         F: Fn(J::Type) + Sync,
     {
-        run_micropool_for_each_with_pool(self.join, self.cache, self.thread_pool, f);
+        run_micropool_for_each_with_pool(
+            self.join,
+            self.cache,
+            self.index_bound,
+            self.thread_pool,
+            f,
+        );
     }
 }
 
@@ -517,6 +592,7 @@ where
         run_micropool_upper_bounded_with_pool(
             self.join,
             self.cache,
+            self.index_bound,
             self.thread_pool,
             init,
             process_item,
@@ -530,7 +606,14 @@ where
         accum: impl Accumulator<Self::Item, Accum> + Sync,
         reduce: impl ExactSizeAccumulator<Accum, Output>,
     ) -> Output {
-        run_micropool_pipeline_with_pool(self.join, self.cache, self.thread_pool, accum, reduce)
+        run_micropool_pipeline_with_pool(
+            self.join,
+            self.cache,
+            self.index_bound,
+            self.thread_pool,
+            accum,
+            reduce,
+        )
     }
 }
 
@@ -554,6 +637,7 @@ where
             self.join,
             self.pool,
             self.cache,
+            self.index_bound,
             self.split,
             init,
             process_item,
@@ -567,7 +651,15 @@ where
         accum: impl Accumulator<Self::Item, Accum> + Sync,
         reduce: impl ExactSizeAccumulator<Accum, Output>,
     ) -> Output {
-        run_micropool_pipeline(self.join, self.pool, self.cache, self.split, accum, reduce)
+        run_micropool_pipeline(
+            self.join,
+            self.pool,
+            self.cache,
+            self.index_bound,
+            self.split,
+            accum,
+            reduce,
+        )
     }
 }
 
@@ -664,10 +756,100 @@ macro_rules! with_micropool_split {
 }
 
 #[cfg(feature = "micropool")]
+#[inline]
+fn unconstrained_item<J>(keys: &J::Mask, values: &J::Value, raw_index: usize) -> Option<J::Type>
+where
+    J: ParJoin,
+{
+    debug_assert!(raw_index < HIBITSET_INDEX_COUNT);
+    // `HIBITSET_INDEX_COUNT` is at most 2^24 on supported targets, so this
+    // narrowing conversion always fits in hibitset's `u32` index.
+    let index = raw_index as Index;
+    if keys.contains(index) {
+        // SAFETY: The mask was checked for `index`, and Micropool's range
+        // source visits each raw index at most once. Therefore concurrent
+        // calls use distinct indices as required by `ParJoin`.
+        Some(unsafe { J::get(values, index) })
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "micropool")]
+fn run_unconstrained_for_each<J, P, F>(
+    keys: &J::Mask,
+    values: &J::Value,
+    index_bound: usize,
+    pool: P,
+    f: F,
+) where
+    J: ParJoin + Send,
+    J::Mask: Sync,
+    J::Value: Send + Sync,
+    P: GenericThreadPool,
+    F: Fn(J::Type) + Sync,
+{
+    (0..index_bound)
+        .into_par_iter()
+        .filter_map(|index| unconstrained_item::<J>(keys, values, index))
+        .with_thread_pool(pool)
+        .for_each(f);
+}
+
+#[cfg(feature = "micropool")]
+fn run_unconstrained_upper_bounded<J, P, Output, Accum>(
+    keys: &J::Mask,
+    values: &J::Value,
+    index_bound: usize,
+    pool: P,
+    init: impl Fn() -> Accum + Sync,
+    process_item: impl Fn(Accum, usize, J::Type) -> ControlFlow<Accum, Accum> + Sync,
+    finalize: impl Fn(Accum) -> Output + Sync,
+    reduce: impl Fn(Output, Output) -> Output,
+) -> Output
+where
+    J: ParJoin + Send,
+    J::Mask: Sync,
+    J::Value: Send + Sync,
+    P: GenericThreadPool,
+    Output: Send,
+{
+    (0..index_bound)
+        .into_par_iter()
+        .filter_map(|index| unconstrained_item::<J>(keys, values, index))
+        .with_thread_pool(pool)
+        .upper_bounded_pipeline(init, process_item, finalize, reduce)
+}
+
+#[cfg(feature = "micropool")]
+fn run_unconstrained_pipeline<J, P, Output, Accum>(
+    keys: &J::Mask,
+    values: &J::Value,
+    index_bound: usize,
+    pool: P,
+    accum: impl Accumulator<J::Type, Accum> + Sync,
+    reduce: impl ExactSizeAccumulator<Accum, Output>,
+) -> Output
+where
+    J: ParJoin + Send,
+    J::Mask: Sync,
+    J::Value: Send + Sync,
+    P: GenericThreadPool,
+    Accum: Send,
+{
+    (0..index_bound)
+        .into_par_iter()
+        .filter_map(|index| unconstrained_item::<J>(keys, values, index))
+        .with_thread_pool(pool)
+        .iter_pipeline(accum, reduce)
+}
+
+#[cfg(feature = "micropool")]
 fn run_micropool_for_each<J, F>(
     join: J,
     pool: Option<&micropool::ThreadPool>,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     split: MicropoolSplit,
     f: F,
 ) where
@@ -676,9 +858,17 @@ fn run_micropool_for_each<J, F>(
     J::Value: Send + Sync,
     F: Fn(J::Type) + Sync,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return with_micropool_split!(pool, split, index_bound, |thread_pool| {
+            run_unconstrained_for_each::<J, _, _>(&keys, &values, index_bound, thread_pool, f)
+        });
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -696,6 +886,7 @@ fn run_micropool_for_each<J, F>(
 fn run_micropool_for_each_with_pool<J, P, F>(
     join: J,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     thread_pool: P,
     f: F,
 ) where
@@ -705,9 +896,15 @@ fn run_micropool_for_each_with_pool<J, P, F>(
     P: GenericThreadPool,
     F: Fn(J::Type) + Sync,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return run_unconstrained_for_each::<J, _, _>(&keys, &values, index_bound, thread_pool, f);
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -742,6 +939,7 @@ fn run_micropool_upper_bounded<J, Output, Accum>(
     join: J,
     pool: Option<&micropool::ThreadPool>,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     split: MicropoolSplit,
     init: impl Fn() -> Accum + Sync,
     process_item: impl Fn(Accum, usize, J::Type) -> ControlFlow<Accum, Accum> + Sync,
@@ -754,9 +952,26 @@ where
     J::Value: Send + Sync,
     Output: Send,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return with_micropool_split!(pool, split, index_bound, |thread_pool| {
+            run_unconstrained_upper_bounded::<J, _, _, _>(
+                &keys,
+                &values,
+                index_bound,
+                thread_pool,
+                init,
+                process_item,
+                finalize,
+                reduce,
+            )
+        });
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -782,6 +997,7 @@ where
 fn run_micropool_upper_bounded_with_pool<J, P, Output, Accum>(
     join: J,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     thread_pool: P,
     init: impl Fn() -> Accum + Sync,
     process_item: impl Fn(Accum, usize, J::Type) -> ControlFlow<Accum, Accum> + Sync,
@@ -795,9 +1011,24 @@ where
     P: GenericThreadPool,
     Output: Send,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return run_unconstrained_upper_bounded::<J, _, _, _>(
+            &keys,
+            &values,
+            index_bound,
+            thread_pool,
+            init,
+            process_item,
+            finalize,
+            reduce,
+        );
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -848,6 +1079,7 @@ fn run_micropool_pipeline<J, Output, Accum>(
     join: J,
     pool: Option<&micropool::ThreadPool>,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     split: MicropoolSplit,
     accum: impl Accumulator<J::Type, Accum> + Sync,
     reduce: impl ExactSizeAccumulator<Accum, Output>,
@@ -858,9 +1090,24 @@ where
     J::Value: Send + Sync,
     Accum: Send,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return with_micropool_split!(pool, split, index_bound, |thread_pool| {
+            run_unconstrained_pipeline::<J, _, _, _>(
+                &keys,
+                &values,
+                index_bound,
+                thread_pool,
+                accum,
+                reduce,
+            )
+        });
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -878,6 +1125,7 @@ where
 fn run_micropool_pipeline_with_pool<J, P, Output, Accum>(
     join: J,
     cache: Option<&mut ParJoinCache>,
+    index_bound: Option<usize>,
     thread_pool: P,
     accum: impl Accumulator<J::Type, Accum> + Sync,
     reduce: impl ExactSizeAccumulator<Accum, Output>,
@@ -889,9 +1137,22 @@ where
     P: GenericThreadPool,
     Accum: Send,
 {
-    // SAFETY: `indices` is built from the mask paired with `values`, and the
-    // mask iterator does not repeat indices by the `ParJoin` contract.
+    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
+    // execution paths call `J::get` only after checking mask membership and
+    // at most once for each distinct index.
     let (keys, values) = unsafe { join.open() };
+    if J::is_unconstrained() {
+        let index_bound = unconstrained_index_bound::<J>(index_bound);
+        return run_unconstrained_pipeline::<J, _, _, _>(
+            &keys,
+            &values,
+            index_bound,
+            thread_pool,
+            accum,
+            reduce,
+        );
+    }
+
     let mut local_cache = ParJoinCache::new();
     let cache = match cache {
         Some(cache) => cache,
@@ -936,6 +1197,54 @@ where
 #[cfg(all(test, feature = "micropool"))]
 mod tests {
     use super::*;
+    use crate::join::LendJoin;
+    use std::sync::atomic::AtomicUsize;
+
+    struct EmptyUnconstrainedJoin;
+
+    // SAFETY: The returned mask is empty, so `get` is never callable after the
+    // required mask check.
+    unsafe impl ParJoin for EmptyUnconstrainedJoin {
+        type Mask = hibitset::BitSet;
+        type Type = ();
+        type Value = ();
+
+        unsafe fn open(self) -> (Self::Mask, Self::Value) {
+            (hibitset::BitSet::new(), ())
+        }
+
+        unsafe fn get(_: &Self::Value, _: Index) -> Self::Type {
+            unreachable!("an empty mask must never yield an item")
+        }
+
+        fn is_unconstrained() -> bool {
+            true
+        }
+    }
+
+    struct SparseUnconstrainedJoin {
+        mask: hibitset::BitSet,
+    }
+
+    // SAFETY: `get` accepts every index present in `mask`, and the mask
+    // iterator does not repeat indices.
+    unsafe impl ParJoin for SparseUnconstrainedJoin {
+        type Mask = hibitset::BitSet;
+        type Type = Index;
+        type Value = ();
+
+        unsafe fn open(self) -> (Self::Mask, Self::Value) {
+            (self.mask, ())
+        }
+
+        unsafe fn get(_: &Self::Value, index: Index) -> Self::Type {
+            index
+        }
+
+        fn is_unconstrained() -> bool {
+            true
+        }
+    }
 
     #[test]
     fn default_work_units_keep_every_item_stealable() {
@@ -974,5 +1283,101 @@ mod tests {
         cache.refill(&mask);
         assert_eq!(cache.indices.as_ptr(), allocation);
         assert_eq!(cache.indices.capacity(), capacity);
+    }
+
+    #[test]
+    fn unconstrained_join_bypasses_index_cache_for_adaptor_pipelines() {
+        let mut seeded_mask = hibitset::BitSet::new();
+        let mut cache = ParJoinCache::new();
+        for index in 0..100 {
+            seeded_mask.add(index);
+        }
+        cache.refill(&seeded_mask);
+
+        let allocation = cache.indices.as_ptr();
+        let capacity = cache.indices.capacity();
+        let len = cache.indices.len();
+        let empty_mask = hibitset::BitSet::new();
+
+        let first_missing = (&empty_mask)
+            .maybe()
+            .micropool_join_with_cache(&mut cache)
+            .with_index_bound(8)
+            .find_first(Option::is_none);
+        assert_eq!(first_missing, Some(None));
+
+        let any_missing = (&empty_mask)
+            .maybe()
+            .micropool_join_with_cache(&mut cache)
+            .with_index_bound(8)
+            .find_any(Option::is_none);
+        assert_eq!(any_missing, Some(None));
+
+        assert_eq!(cache.indices.as_ptr(), allocation);
+        assert_eq!(cache.indices.capacity(), capacity);
+        assert_eq!(cache.indices.len(), len);
+    }
+
+    #[test]
+    fn unconstrained_for_each_bypasses_index_cache() {
+        let mut cache = ParJoinCache::new();
+
+        EmptyUnconstrainedJoin
+            .micropool_join_with_cache(&mut cache)
+            .with_index_bound(8)
+            .for_each(|()| unreachable!("an empty mask must not execute the callback"));
+
+        assert!(cache.indices.is_empty());
+        assert!(!cache.indices.spilled());
+    }
+
+    #[test]
+    fn unconstrained_index_bound_is_exclusive_for_adaptor_pipelines() {
+        let mut mask = hibitset::BitSet::new();
+        mask.add(4);
+        mask.add(5);
+
+        let first = SparseUnconstrainedJoin { mask }
+            .micropool_join()
+            .with_index_bound(5)
+            .find_first(|_| true);
+
+        assert_eq!(first, Some(4));
+
+        let mut mask = hibitset::BitSet::new();
+        mask.add(5);
+        let outside_bound = SparseUnconstrainedJoin { mask }
+            .micropool_join()
+            .with_index_bound(5)
+            .find_any(|_| true);
+
+        assert_eq!(outside_bound, None);
+    }
+
+    #[test]
+    fn unconstrained_index_bound_reaches_for_each_and_concrete_pool() {
+        let mut mask = hibitset::BitSet::new();
+        mask.add(1);
+        mask.add(3);
+        mask.add(5);
+
+        let count = AtomicUsize::new(0);
+        SparseUnconstrainedJoin { mask }
+            .micropool_join()
+            .with_index_bound(4)
+            .with_thread_pool(micropool::split_by_threads())
+            .for_each(|_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn unconstrained_index_bound_is_clamped_to_hibitset_capacity() {
+        assert_eq!(
+            unconstrained_index_bound::<EmptyUnconstrainedJoin>(Some(usize::MAX)),
+            HIBITSET_INDEX_COUNT
+        );
     }
 }
