@@ -210,6 +210,10 @@ pub mod world;
 
 pub use hibitset::BitSet;
 pub use shred::{
+    AccessError, AccessMode, AccessRequest, AccessSnapshot, AccessStats, BorrowInfo, FetchBundle,
+    ResourceBundle,
+};
+pub use shred::{
     Accessor, AccessorCow, BatchAccessor, BatchController, BatchUncheckedWorld, Dispatcher,
     DispatcherBuilder, Read, ReadExpect, RunNow, RunningTime, SendDispatcher, StaticAccessor,
     System, SystemData, World, Write, WriteExpect,

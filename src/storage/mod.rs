@@ -239,6 +239,7 @@ impl<T: Component> Drop for MaskedStorage<T> {
 /// A wrapper around the masked storage and the generations vector.
 /// Can be used for safe lookup of components, insertions and removes.
 /// This is what `World::read/write` fetches for the user.
+#[must_use = "keep this storage alive while accessing components; discarding it releases its guards"]
 pub struct Storage<'e, T, D> {
     data: D,
     entities: Fetch<'e, EntitiesRes>,

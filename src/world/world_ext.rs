@@ -9,7 +9,7 @@ use crate::{
     error::WrongGeneration,
     storage::{AnyStorage, MaskedStorage},
 };
-use shred::{Fetch, FetchMut, MetaTable, Read, Resource, SystemData, World};
+use shred::{AccessError, Fetch, FetchMut, MetaTable, Read, Resource, SystemData, World};
 
 /// This trait provides some extension methods to make working with shred's
 /// [World] easier.
@@ -160,12 +160,19 @@ pub trait WorldExt {
     #[deprecated(since = "0.15.0", note = "use `World::insert` instead")]
     fn add_resource<T: Resource>(&mut self, res: T);
 
+    /// Acquires a tuple of storages without waiting. Use `ReadStorage<T>` and
+    /// `WriteStorage<T>` to declare each component's access mode. All-or-nothing:
+    /// failure releases every guard taken by the attempt; entity reads are coalesced.
+    #[track_caller]
+    fn try_storages<'a, B: shred::FetchBundle<'a>>(&'a self) -> Result<B, AccessError>;
+
     /// Fetches a component storage for reading.
     ///
     /// ## Panics
     ///
     /// Panics if it is already borrowed mutably.
     /// Panics if the component has not been registered.
+    #[track_caller]
     fn read_component<T: Component>(&self) -> ReadStorage<T>;
 
     /// Fetches a component storage for writing.
@@ -174,7 +181,66 @@ pub trait WorldExt {
     ///
     /// Panics if it is already borrowed.
     /// Panics if the component has not been registered.
+    #[track_caller]
     fn write_component<T: Component>(&self) -> WriteStorage<T>;
+
+    /// Observes whether the component storage has a read or write lock.
+    /// Returns `None` for an unregistered component. Does not acquire a guard
+    /// or inspect the separate `EntitiesRes` lock. Use `try_*` to actually acquire.
+    fn is_component_locked<T: Component>(&self) -> Option<bool>;
+
+    /// Observes whether a writer holds the component storage. Returns `None`
+    /// for an unregistered component. Transient; not an ownership query.
+    fn is_component_write_locked<T: Component>(&self) -> Option<bool>;
+
+    /// Whether this thread holds a guard for the component storage (exact).
+    /// Does not inspect `EntitiesRes`.
+    fn is_component_owned_by_current_thread<T: Component>(&self) -> Option<bool>;
+
+    /// Captures the storage's borrow state; holders need the `access-trace` feature.
+    fn component_access_snapshot<T: Component>(&self) -> Option<shred::AccessSnapshot>;
+
+    /// Alias for `is_component_owned_by_current_thread`.
+    fn is_storage_owned_by_current_thread<T: Component>(&self) -> Option<bool> {
+        self.is_component_owned_by_current_thread::<T>()
+    }
+
+    /// Alias for `component_access_snapshot`.
+    fn storage_access_snapshot<T: Component>(&self) -> Option<shred::AccessSnapshot> {
+        self.component_access_snapshot::<T>()
+    }
+
+    /// Attempts to read a storage without waiting or panicking on contention.
+    /// Failure can refer to either `EntitiesRes` or the component storage.
+    #[track_caller]
+    fn try_read_component<T: Component>(&self) -> Result<ReadStorage<'_, T>, AccessError>;
+
+    /// Attempts to write a storage without waiting or panicking on contention.
+    /// On failure, any intermediate entity borrow is released.
+    #[track_caller]
+    fn try_write_component<T: Component>(&self) -> Result<WriteStorage<'_, T>, AccessError>;
+
+    /// Alias for `is_component_locked`; this query does not acquire a guard.
+    fn is_storage_locked<T: Component>(&self) -> Option<bool> {
+        self.is_component_locked::<T>()
+    }
+
+    /// Alias for `is_component_write_locked`.
+    fn is_storage_write_locked<T: Component>(&self) -> Option<bool> {
+        self.is_component_write_locked::<T>()
+    }
+
+    /// Alias for `try_read_component`.
+    #[track_caller]
+    fn try_read_storage<T: Component>(&self) -> Result<ReadStorage<'_, T>, AccessError> {
+        self.try_read_component()
+    }
+
+    /// Alias for `try_write_component`.
+    #[track_caller]
+    fn try_write_storage<T: Component>(&self) -> Result<WriteStorage<'_, T>, AccessError> {
+        self.try_write_component()
+    }
 
     /// Fetches a component storage for reading.
     ///
@@ -182,6 +248,7 @@ pub trait WorldExt {
     ///
     /// Panics if it is already borrowed mutably.
     /// Panics if the component has not been registered.
+    #[track_caller]
     fn read_storage<T: Component>(&self) -> ReadStorage<T> {
         self.read_component()
     }
@@ -192,6 +259,7 @@ pub trait WorldExt {
     ///
     /// Panics if it is already borrowed.
     /// Panics if the component has not been registered.
+    #[track_caller]
     fn write_storage<T: Component>(&self) -> WriteStorage<T> {
         self.write_component()
     }
@@ -202,6 +270,7 @@ pub trait WorldExt {
     ///
     /// Panics if it is already borrowed mutably.
     /// Panics if the resource has not been added.
+    #[track_caller]
     fn read_resource<T: Resource>(&self) -> Fetch<T>;
 
     /// Fetches a resource for writing.
@@ -210,6 +279,7 @@ pub trait WorldExt {
     ///
     /// Panics if it is already borrowed.
     /// Panics if the resource has not been added.
+    #[track_caller]
     fn write_resource<T: Resource>(&self) -> FetchMut<T>;
 
     /// Convenience method for fetching entities.
@@ -296,6 +366,11 @@ pub trait WorldExt {
 }
 
 impl WorldExt for World {
+    #[track_caller]
+    fn try_storages<'a, B: shred::FetchBundle<'a>>(&'a self) -> Result<B, AccessError> {
+        self.try_fetch_bundle()
+    }
+
     fn new() -> Self {
         let mut world = Self::default();
         world.insert(EntitiesRes::default());
@@ -327,18 +402,48 @@ impl WorldExt for World {
         self.insert(res);
     }
 
+    #[track_caller]
     fn read_component<T: Component>(&self) -> ReadStorage<T> {
         self.system_data()
     }
 
+    #[track_caller]
     fn write_component<T: Component>(&self) -> WriteStorage<T> {
         self.system_data()
     }
 
+    fn is_component_locked<T: Component>(&self) -> Option<bool> {
+        self.is_resource_locked::<MaskedStorage<T>>()
+    }
+
+    fn is_component_write_locked<T: Component>(&self) -> Option<bool> {
+        self.is_resource_write_locked::<MaskedStorage<T>>()
+    }
+
+    fn is_component_owned_by_current_thread<T: Component>(&self) -> Option<bool> {
+        self.is_resource_owned_by_current_thread::<MaskedStorage<T>>()
+    }
+
+    fn component_access_snapshot<T: Component>(&self) -> Option<shred::AccessSnapshot> {
+        self.resource_access_snapshot::<MaskedStorage<T>>()
+    }
+
+    #[track_caller]
+    fn try_read_component<T: Component>(&self) -> Result<ReadStorage<'_, T>, AccessError> {
+        self.try_fetch_bundle()
+    }
+
+    #[track_caller]
+    fn try_write_component<T: Component>(&self) -> Result<WriteStorage<'_, T>, AccessError> {
+        self.try_fetch_bundle()
+    }
+
+    #[track_caller]
     fn read_resource<T: Resource>(&self) -> Fetch<T> {
         self.fetch()
     }
 
+    #[track_caller]
     fn write_resource<T: Resource>(&self) -> FetchMut<T> {
         self.fetch_mut()
     }

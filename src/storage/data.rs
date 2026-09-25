@@ -116,6 +116,16 @@ use crate::{
 /// to be used for entity initialization.
 pub type ReadStorage<'a, T> = Storage<'a, T, Fetch<'a, MaskedStorage<T>>>;
 
+impl<'a, T: Component> shred::FetchBundle<'a> for ReadStorage<'a, T> {
+    fn requests() -> Vec<shred::AccessRequest> {
+        vec![shred::AccessRequest::read::<EntitiesRes>(), shred::AccessRequest::read::<MaskedStorage<T>>()]
+    }
+    #[track_caller]
+    fn from_bundle(bundle: &mut shred::ResourceBundle<'a>) -> Result<Self, shred::AccessError> {
+        Ok(Storage::new(bundle.take_read()?, bundle.take_read()?))
+    }
+}
+
 impl<'a, T> SystemData<'a> for ReadStorage<'a, T>
 where
     T: Component,
@@ -202,6 +212,16 @@ where
 /// There's also an Entry-API similar to the one provided by
 /// `std::collections::HashMap`.
 pub type WriteStorage<'a, T> = Storage<'a, T, FetchMut<'a, MaskedStorage<T>>>;
+
+impl<'a, T: Component> shred::FetchBundle<'a> for WriteStorage<'a, T> {
+    fn requests() -> Vec<shred::AccessRequest> {
+        vec![shred::AccessRequest::read::<EntitiesRes>(), shred::AccessRequest::write::<MaskedStorage<T>>()]
+    }
+    #[track_caller]
+    fn from_bundle(bundle: &mut shred::ResourceBundle<'a>) -> Result<Self, shred::AccessError> {
+        Ok(Storage::new(bundle.take_read()?, bundle.take_write()?))
+    }
+}
 
 impl<'a, T> SystemData<'a> for WriteStorage<'a, T>
 where

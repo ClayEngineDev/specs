@@ -122,7 +122,11 @@ pub unsafe trait ParJoin {
             );
         }
 
-        JoinParIter(self)
+        // Open on the calling thread: guards stay there, while only the
+        // mask and value views satisfying Send/Sync reach Rayon workers.
+        // SAFETY: the paired views remain private to JoinParIter.
+        let (keys, values) = unsafe { self.open() };
+        JoinParIter { keys, values }
     }
 
     /// Create a micropool parallel iterator over the contents.
@@ -215,12 +219,15 @@ pub unsafe trait ParJoin {
 /// `JoinParIter` is a `ParallelIterator` over a group of storages.
 #[cfg(feature = "parallel")]
 #[must_use]
-pub struct JoinParIter<J>(J);
+pub struct JoinParIter<J: ParJoin> {
+    keys: J::Mask,
+    values: J::Value,
+}
 
 #[cfg(feature = "parallel")]
 impl<J> ParallelIterator for JoinParIter<J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Type: Send,
     J::Value: Send + Sync,
@@ -233,7 +240,7 @@ where
     {
         // SAFETY: `keys` and `values` are not exposed outside this module and
         // we only use `values` for calling `ParJoin::get`.
-        let (keys, values) = unsafe { self.0.open() };
+        let Self { keys, values } = self;
         // Create a bit producer which splits on up to three levels
         let producer = BitProducer((&keys).iter(), 3);
 
@@ -244,7 +251,7 @@ where
 #[cfg(feature = "parallel")]
 struct JoinProducer<'a, J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync + 'a,
     J::Type: Send,
     J::Value: Send + Sync + 'a,
@@ -256,7 +263,7 @@ where
 #[cfg(feature = "parallel")]
 impl<'a, J> JoinProducer<'a, J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Type: Send,
     J::Value: 'a + Send + Sync,
     J::Mask: 'a + Send + Sync,
@@ -269,7 +276,7 @@ where
 #[cfg(feature = "parallel")]
 impl<'a, J> UnindexedProducer for JoinProducer<'a, J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Type: Send,
     J::Value: 'a + Send + Sync,
     J::Mask: 'a + Send + Sync,
@@ -344,7 +351,7 @@ pub struct JoinMicropoolIter<'pool, J> {
 #[cfg(feature = "micropool")]
 impl<'pool, J> JoinMicropoolIter<'pool, J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
 {
@@ -539,7 +546,7 @@ pub struct JoinMicropoolIterWithPool<'cache, J, P> {
 #[cfg(feature = "micropool")]
 impl<J, P> JoinMicropoolIterWithPool<'_, J, P>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -575,7 +582,7 @@ where
 #[cfg(feature = "micropool")]
 impl<J, P> MicropoolParallelIterator for JoinMicropoolIterWithPool<'_, J, P>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -620,7 +627,7 @@ where
 #[cfg(feature = "micropool")]
 impl<J> MicropoolParallelIterator for JoinMicropoolIter<'_, J>
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
 {
@@ -783,7 +790,7 @@ fn run_unconstrained_for_each<J, P, F>(
     pool: P,
     f: F,
 ) where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -808,7 +815,7 @@ fn run_unconstrained_upper_bounded<J, P, Output, Accum>(
     reduce: impl Fn(Output, Output) -> Output,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -831,7 +838,7 @@ fn run_unconstrained_pipeline<J, P, Output, Accum>(
     reduce: impl ExactSizeAccumulator<Accum, Output>,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -853,7 +860,7 @@ fn run_micropool_for_each<J, F>(
     split: MicropoolSplit,
     f: F,
 ) where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     F: Fn(J::Type) + Sync,
@@ -890,7 +897,7 @@ fn run_micropool_for_each_with_pool<J, P, F>(
     thread_pool: P,
     f: F,
 ) where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -918,7 +925,7 @@ fn run_micropool_for_each_with_pool<J, P, F>(
 #[cfg(feature = "micropool")]
 fn run_indexed_for_each<J, P, F>(indices: &[Index], values: &J::Value, pool: P, f: F)
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Value: Send + Sync,
     P: GenericThreadPool,
     F: Fn(J::Type) + Sync,
@@ -947,7 +954,7 @@ fn run_micropool_upper_bounded<J, Output, Accum>(
     reduce: impl Fn(Output, Output) -> Output,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     Output: Send,
@@ -1005,7 +1012,7 @@ fn run_micropool_upper_bounded_with_pool<J, P, Output, Accum>(
     reduce: impl Fn(Output, Output) -> Output,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -1058,7 +1065,7 @@ fn run_indexed_upper_bounded<J, P, Output, Accum>(
     reduce: impl Fn(Output, Output) -> Output,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Value: Send + Sync,
     P: GenericThreadPool,
     Output: Send,
@@ -1085,7 +1092,7 @@ fn run_micropool_pipeline<J, Output, Accum>(
     reduce: impl ExactSizeAccumulator<Accum, Output>,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     Accum: Send,
@@ -1131,7 +1138,7 @@ fn run_micropool_pipeline_with_pool<J, P, Output, Accum>(
     reduce: impl ExactSizeAccumulator<Accum, Output>,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Mask: Send + Sync,
     J::Value: Send + Sync,
     P: GenericThreadPool,
@@ -1178,7 +1185,7 @@ fn run_indexed_pipeline<J, P, Output, Accum>(
     reduce: impl ExactSizeAccumulator<Accum, Output>,
 ) -> Output
 where
-    J: ParJoin + Send,
+    J: ParJoin,
     J::Value: Send + Sync,
     P: GenericThreadPool,
     Accum: Send,

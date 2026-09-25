@@ -9,6 +9,10 @@ pub use crate::join::LendJoin;
 pub use crate::join::ParJoin;
 pub use hibitset::BitSet;
 pub use shred::{
+    AccessError, AccessMode, AccessRequest, AccessSnapshot, AccessStats, BorrowInfo, FetchBundle,
+    ResourceBundle,
+};
+pub use shred::{
     Accessor, Dispatcher, DispatcherBuilder, Read, ReadExpect, Resource, ResourceId, RunNow,
     StaticAccessor, System, SystemData, World, Write, WriteExpect,
 };

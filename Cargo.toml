@@ -45,6 +45,8 @@ stdweb = ["dep:uuid", "uuid?/js"]
 storage-event-control = []
 derive = ["shred-derive", "specs-derive"]
 nightly = ["shred/nightly"]
+# Holder records in borrow panics + undeclared-access audit; see shred `access-trace`.
+access-trace = ["shred/access-trace"]
 
 shred-derive = ["shred/shred-derive"]
 
