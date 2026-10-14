@@ -20,7 +20,7 @@ use smallvec::SmallVec;
 #[cfg(feature = "micropool")]
 use std::num::NonZeroUsize;
 #[cfg(feature = "micropool")]
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 #[cfg(feature = "micropool")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -513,23 +513,20 @@ where
         }
     }
 
-    /// Runs `f` through micropool's native indexed pipeline.
+    /// Runs `f` over the joined entities, one work unit per contiguous chunk.
     ///
-    /// This terminal path fills the reusable cache directly and avoids routing
-    /// the common `.micropool_join().for_each(...)` form through the generic
-    /// adaptor pipeline.
+    /// This terminal path fills the reusable cache directly and hands
+    /// micropool a type-erased chunk callback, so micropool and paralight are
+    /// not instantiated per join type, callback and split strategy (see
+    /// `run_chunked`).
     pub fn for_each<F>(self, f: F)
     where
         F: Fn(J::Type) + Sync,
     {
-        run_micropool_for_each(
-            self.join,
-            self.pool,
-            self.cache,
-            self.index_bound,
-            self.split,
-            f,
-        );
+        let (pool, split) = (self.pool, self.split);
+        run_micropool_for_each(self.join, self.cache, self.index_bound, f, |len, body| {
+            run_chunked(pool, split, len, body)
+        });
     }
 }
 
@@ -565,17 +562,17 @@ where
 
     /// Runs `f` using the concrete micropool strategy supplied by
     /// [`JoinMicropoolIter::with_thread_pool`].
+    ///
+    /// The strategy's partitioning is opaque, so the callback is erased per
+    /// item rather than per work unit.
     pub fn for_each<F>(self, f: F)
     where
         F: Fn(J::Type) + Sync,
     {
-        run_micropool_for_each_with_pool(
-            self.join,
-            self.cache,
-            self.index_bound,
-            self.thread_pool,
-            f,
-        );
+        let thread_pool = self.thread_pool;
+        run_micropool_for_each(self.join, self.cache, self.index_bound, f, |len, body| {
+            run_items_with_pool(len, thread_pool, &|i| body(i..i + 1))
+        });
     }
 }
 
@@ -693,69 +690,26 @@ fn adaptive_work_units(
         .min(max_parallelism.max(1))
 }
 
+/// Binds `$thread_pool` to a micropool strategy that partitions `$input_len`
+/// items like `chunk_size` (the same partition `for_each` uses) and evaluates
+/// `$body`. Every split maps onto `split_by`, so adaptor pipelines are
+/// instantiated for two strategy types (current / explicit pool) instead of
+/// one per split variant; at least one work unit keeps empty inputs reducible.
 #[cfg(feature = "micropool")]
 macro_rules! with_micropool_split {
     ($pool:expr, $split:expr, $input_len:expr, |$thread_pool:ident| $body:block) => {{
+        let pool: Option<&micropool::ThreadPool> = $pool;
         let input_len = $input_len;
-        match ($pool, $split) {
-            (
-                Some(pool),
-                MicropoolSplit::Adaptive {
-                    max_parallelism,
-                    min_items_per_work_unit,
-                },
-            ) => {
-                let available = pool.num_threads().saturating_add(1);
-                let max_parallelism = effective_parallelism(max_parallelism, available);
-                let work_units =
-                    adaptive_work_units(input_len, max_parallelism, min_items_per_work_unit);
+        let work_units = input_len
+            .div_ceil(chunk_size(pool, $split, input_len))
+            .max(1);
+        match pool {
+            Some(pool) => {
                 let $thread_pool = pool.split_by(work_units);
                 $body
             }
-            (
-                None,
-                MicropoolSplit::Adaptive {
-                    max_parallelism,
-                    min_items_per_work_unit,
-                },
-            ) => {
-                let available = micropool::num_threads().saturating_add(1);
-                let max_parallelism = effective_parallelism(max_parallelism, available);
-                let work_units =
-                    adaptive_work_units(input_len, max_parallelism, min_items_per_work_unit);
+            None => {
                 let $thread_pool = micropool::split_by(work_units);
-                $body
-            }
-            (Some(pool), MicropoolSplit::PerItem) => {
-                let $thread_pool = pool.split_per_item();
-                $body
-            }
-            (None, MicropoolSplit::PerItem) => {
-                let $thread_pool = micropool::split_per_item();
-                $body
-            }
-            (Some(pool), MicropoolSplit::Per(chunk_size)) => {
-                let $thread_pool = pool.split_per(chunk_size);
-                $body
-            }
-            (None, MicropoolSplit::Per(chunk_size)) => {
-                let $thread_pool = micropool::split_per(chunk_size);
-                $body
-            }
-            (Some(pool), MicropoolSplit::By(chunks)) => {
-                let $thread_pool = pool.split_by(chunks);
-                $body
-            }
-            (None, MicropoolSplit::By(chunks)) => {
-                let $thread_pool = micropool::split_by(chunks);
-                $body
-            }
-            (Some(pool), MicropoolSplit::ByThreads) => {
-                let $thread_pool = pool.split_by_threads();
-                $body
-            }
-            (None, MicropoolSplit::ByThreads) => {
-                let $thread_pool = micropool::split_by_threads();
                 $body
             }
         }
@@ -782,25 +736,76 @@ where
     }
 }
 
+/// Chunk length that reproduces the work units micropool's own `split`
+/// strategy would create for `len` items.
 #[cfg(feature = "micropool")]
-fn run_unconstrained_for_each<J, P, F>(
-    keys: &J::Mask,
-    values: &J::Value,
-    index_bound: usize,
-    pool: P,
-    f: F,
-) where
-    J: ParJoin,
-    J::Mask: Sync,
-    J::Value: Send + Sync,
-    P: GenericThreadPool,
-    F: Fn(J::Type) + Sync,
-{
-    (0..index_bound)
+fn chunk_size(pool: Option<&micropool::ThreadPool>, split: MicropoolSplit, len: usize) -> usize {
+    let available = || {
+        pool.map_or_else(micropool::num_threads, micropool::ThreadPool::num_threads)
+            .saturating_add(1)
+    };
+    let chunk = match split {
+        MicropoolSplit::Adaptive {
+            max_parallelism,
+            min_items_per_work_unit,
+        } => {
+            let max_parallelism = effective_parallelism(max_parallelism, available());
+            len.div_ceil(adaptive_work_units(len, max_parallelism, min_items_per_work_unit))
+        }
+        MicropoolSplit::PerItem => 1,
+        MicropoolSplit::Per(chunk_size) => chunk_size,
+        MicropoolSplit::By(chunks) => len.div_ceil(chunks.max(1)),
+        MicropoolSplit::ByThreads => len.div_ceil(available()),
+    };
+    chunk.max(1)
+}
+
+/// Runs `body` over `0..len` in the contiguous chunks `split` selects, one
+/// micropool work unit per chunk.
+///
+/// Not generic on purpose: micropool and paralight nest every closure they
+/// receive into their own closure types, so feeding them the join type and
+/// callback produced debug-info type names tens of kilobytes long, once per
+/// join, callback and split strategy. Erased here they are instantiated once
+/// per program; the per-item loop stays monomorphic inside `body`, so the cost
+/// is one indirect call per work unit.
+#[cfg(feature = "micropool")]
+#[inline(never)]
+fn run_chunked(
+    pool: Option<&micropool::ThreadPool>,
+    split: MicropoolSplit,
+    len: usize,
+    body: &(dyn Fn(Range<usize>) + Sync),
+) {
+    let chunk = chunk_size(pool, split, len);
+    let run = |c: usize| {
+        let start = c * chunk;
+        body(start..(start + chunk).min(len));
+    };
+    let chunks = len.div_ceil(chunk);
+    match pool {
+        Some(pool) => run_items_with_pool(chunks, pool.split_per_item(), &run),
+        None => run_items_with_pool(chunks, micropool::split_per_item(), &run),
+    }
+}
+
+/// Runs `body` once per item of `0..len` under a micropool strategy object;
+/// erased per item and instantiated once per `P`.
+#[cfg(feature = "micropool")]
+#[inline(never)]
+fn run_items_with_pool<P: GenericThreadPool>(
+    len: usize,
+    thread_pool: P,
+    body: &(dyn Fn(usize) + Sync),
+) {
+    // Micropool's per-item strategy cannot reduce an empty input.
+    if len == 0 {
+        return;
+    }
+    (0..len)
         .into_par_iter()
-        .filter_map(|index| unconstrained_item::<J>(keys, values, index))
-        .with_thread_pool(pool)
-        .for_each(f);
+        .with_thread_pool(thread_pool)
+        .for_each(body);
 }
 
 #[cfg(feature = "micropool")]
@@ -851,14 +856,16 @@ where
         .iter_pipeline(accum, reduce)
 }
 
+/// Shared body of both `for_each` terminals: hands `run` the number of
+/// candidate positions and an erased callback that processes a range of them.
+/// `run` must pass each position to the callback at most once.
 #[cfg(feature = "micropool")]
 fn run_micropool_for_each<J, F>(
     join: J,
-    pool: Option<&micropool::ThreadPool>,
     cache: Option<&mut ParJoinCache>,
     index_bound: Option<usize>,
-    split: MicropoolSplit,
     f: F,
+    run: impl FnOnce(usize, &(dyn Fn(Range<usize>) + Sync)),
 ) where
     J: ParJoin,
     J::Mask: Send + Sync,
@@ -871,8 +878,12 @@ fn run_micropool_for_each<J, F>(
     let (keys, values) = unsafe { join.open() };
     if J::is_unconstrained() {
         let index_bound = unconstrained_index_bound::<J>(index_bound);
-        return with_micropool_split!(pool, split, index_bound, |thread_pool| {
-            run_unconstrained_for_each::<J, _, _>(&keys, &values, index_bound, thread_pool, f)
+        return run(index_bound, &|range: Range<usize>| {
+            for raw_index in range {
+                if let Some(item) = unconstrained_item::<J>(&keys, &values, raw_index) {
+                    f(item);
+                }
+            }
         });
     }
 
@@ -884,61 +895,13 @@ fn run_micropool_for_each<J, F>(
     cache.refill(&keys);
 
     let indices = cache.indices.as_slice();
-    with_micropool_split!(pool, split, indices.len(), |thread_pool| {
-        run_indexed_for_each::<J, _, _>(indices, &values, thread_pool, f)
-    })
-}
-
-#[cfg(feature = "micropool")]
-fn run_micropool_for_each_with_pool<J, P, F>(
-    join: J,
-    cache: Option<&mut ParJoinCache>,
-    index_bound: Option<usize>,
-    thread_pool: P,
-    f: F,
-) where
-    J: ParJoin,
-    J::Mask: Send + Sync,
-    J::Value: Send + Sync,
-    P: GenericThreadPool,
-    F: Fn(J::Type) + Sync,
-{
-    // SAFETY: `keys` and `values` remain paired and are not exposed. Both
-    // execution paths call `J::get` only after checking mask membership and
-    // at most once for each distinct index.
-    let (keys, values) = unsafe { join.open() };
-    if J::is_unconstrained() {
-        let index_bound = unconstrained_index_bound::<J>(index_bound);
-        return run_unconstrained_for_each::<J, _, _>(&keys, &values, index_bound, thread_pool, f);
-    }
-
-    let mut local_cache = ParJoinCache::new();
-    let cache = match cache {
-        Some(cache) => cache,
-        None => &mut local_cache,
-    };
-    cache.refill(&keys);
-
-    run_indexed_for_each::<J, _, _>(cache.indices.as_slice(), &values, thread_pool, f);
-}
-
-#[cfg(feature = "micropool")]
-fn run_indexed_for_each<J, P, F>(indices: &[Index], values: &J::Value, pool: P, f: F)
-where
-    J: ParJoin,
-    J::Value: Send + Sync,
-    P: GenericThreadPool,
-    F: Fn(J::Type) + Sync,
-{
-    indices
-        .par_iter()
-        .with_thread_pool(pool)
-        .map(|&index| {
+    run(indices.len(), &|range: Range<usize>| {
+        for &index in &indices[range] {
             // SAFETY: Every index came from the mask returned alongside
-            // `values`, and every source position is processed at most once.
-            unsafe { J::get(values, index) }
-        })
-        .for_each(f);
+            // `values`, and ranges never overlap.
+            f(unsafe { J::get(&values, index) });
+        }
+    });
 }
 
 #[cfg(feature = "micropool")]
@@ -1229,13 +1192,14 @@ mod tests {
         }
     }
 
-    struct SparseUnconstrainedJoin {
+    /// Yields the indices in `mask`, reported as unconstrained or not.
+    struct SparseJoin<const UNCONSTRAINED: bool> {
         mask: hibitset::BitSet,
     }
 
     // SAFETY: `get` accepts every index present in `mask`, and the mask
     // iterator does not repeat indices.
-    unsafe impl ParJoin for SparseUnconstrainedJoin {
+    unsafe impl<const UNCONSTRAINED: bool> ParJoin for SparseJoin<UNCONSTRAINED> {
         type Mask = hibitset::BitSet;
         type Type = Index;
         type Value = ();
@@ -1249,7 +1213,7 @@ mod tests {
         }
 
         fn is_unconstrained() -> bool {
-            true
+            UNCONSTRAINED
         }
     }
 
@@ -1344,7 +1308,7 @@ mod tests {
         mask.add(4);
         mask.add(5);
 
-        let first = SparseUnconstrainedJoin { mask }
+        let first = SparseJoin::<true> { mask }
             .micropool_join()
             .with_index_bound(5)
             .find_first(|_| true);
@@ -1353,7 +1317,7 @@ mod tests {
 
         let mut mask = hibitset::BitSet::new();
         mask.add(5);
-        let outside_bound = SparseUnconstrainedJoin { mask }
+        let outside_bound = SparseJoin::<true> { mask }
             .micropool_join()
             .with_index_bound(5)
             .find_any(|_| true);
@@ -1369,7 +1333,7 @@ mod tests {
         mask.add(5);
 
         let count = AtomicUsize::new(0);
-        SparseUnconstrainedJoin { mask }
+        SparseJoin::<true> { mask }
             .micropool_join()
             .with_index_bound(4)
             .with_thread_pool(micropool::split_by_threads())
@@ -1386,5 +1350,128 @@ mod tests {
             unconstrained_index_bound::<EmptyUnconstrainedJoin>(Some(usize::MAX)),
             HIBITSET_INDEX_COUNT
         );
+    }
+
+    /// Runs `run` over a sparse join of `len` entities and asserts that every
+    /// joined index below `bound`, and nothing else, is visited exactly once.
+    fn assert_visits_once_below<const UNCONSTRAINED: bool>(
+        len: u32,
+        bound: usize,
+        run: impl FnOnce(SparseJoin<UNCONSTRAINED>, &(dyn Fn(Index) + Sync)),
+    ) {
+        let mut mask = hibitset::BitSet::new();
+        for i in 0..len {
+            mask.add(i * 3 + 1);
+        }
+        let hits: Vec<AtomicUsize> = (0..len * 3 + 2).map(|_| AtomicUsize::new(0)).collect();
+        run(SparseJoin { mask: mask.clone() }, &|index| {
+            hits[index as usize].fetch_add(1, Ordering::Relaxed);
+        });
+        for (index, hit) in hits.iter().enumerate() {
+            let expected = usize::from(index < bound && mask.contains(index as Index));
+            assert_eq!(hit.load(Ordering::Relaxed), expected, "len {len}, index {index}");
+        }
+    }
+
+    fn assert_visits_once(len: u32, run: impl FnOnce(SparseJoin<false>, &(dyn Fn(Index) + Sync))) {
+        assert_visits_once_below(len, usize::MAX, run);
+    }
+
+    #[test]
+    fn for_each_visits_every_index_once_for_every_strategy() {
+        let pool = micropool::ThreadPoolBuilder::default()
+            .num_threads(3)
+            .build();
+        let mut cache = ParJoinCache::new();
+        for len in [0, 1, 7, 100, 1000] {
+            assert_visits_once(len, |join, f| join.micropool_join().for_each(f));
+            assert_visits_once(len, |join, f| {
+                join.micropool_join_with_cache(&mut cache).for_each(f)
+            });
+            assert_visits_once(len, |join, f| join.micropool_join_with(&pool).for_each(f));
+            assert_visits_once(len, |join, f| {
+                join.micropool_join().with_max_parallelism(2).for_each(f)
+            });
+            assert_visits_once(len, |join, f| {
+                join.micropool_join_with(&pool)
+                    .with_min_items_per_work_unit(16)
+                    .for_each(f)
+            });
+            assert_visits_once(len, |join, f| join.micropool_join().split_per_item().for_each(f));
+            assert_visits_once(len, |join, f| join.micropool_join().split_per(0).for_each(f));
+            assert_visits_once(len, |join, f| join.micropool_join().split_per(5).for_each(f));
+            assert_visits_once(len, |join, f| join.micropool_join().split_by(0).for_each(f));
+            assert_visits_once(len, |join, f| {
+                join.micropool_join_with(&pool).split_by(4).for_each(f)
+            });
+            assert_visits_once(len, |join, f| {
+                join.micropool_join_with(&pool).split_by_threads().for_each(f)
+            });
+            assert_visits_once(len, |join, f| {
+                join.micropool_join()
+                    .with_thread_pool(micropool::split_per_item())
+                    .for_each(f)
+            });
+            assert_visits_once(len, |join, f| {
+                join.micropool_join()
+                    .with_thread_pool(pool.split_by(3))
+                    .for_each(f)
+            });
+        }
+    }
+
+    #[test]
+    fn unconstrained_for_each_visits_masked_indices_below_bound_once() {
+        for len in [0, 1, 7, 100] {
+            let bound = len as usize * 3 / 2;
+            assert_visits_once_below::<true>(len, bound, |join, f| {
+                join.micropool_join().with_index_bound(bound).for_each(f)
+            });
+            assert_visits_once_below::<true>(len, bound, |join, f| {
+                join.micropool_join()
+                    .with_index_bound(bound)
+                    .split_per(3)
+                    .for_each(f)
+            });
+            assert_visits_once_below::<true>(len, bound, |join, f| {
+                join.micropool_join()
+                    .with_index_bound(bound)
+                    .with_thread_pool(micropool::split_by(4))
+                    .for_each(f)
+            });
+        }
+    }
+
+    #[test]
+    fn adaptor_pipelines_accept_empty_joins_with_any_split() {
+        let empty = || SparseJoin::<false> {
+            mask: hibitset::BitSet::new(),
+        };
+        assert_eq!(
+            empty().micropool_join().split_per_item().find_any(|_| true),
+            None
+        );
+        assert_eq!(
+            empty().micropool_join().split_per(4).find_first(|_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn chunk_size_matches_micropool_strategies() {
+        let pool = micropool::ThreadPoolBuilder::default()
+            .num_threads(3)
+            .build();
+        let pool = Some(&pool);
+        assert_eq!(chunk_size(pool, MicropoolSplit::PerItem, 10), 1);
+        assert_eq!(chunk_size(pool, MicropoolSplit::Per(0), 10), 1);
+        assert_eq!(chunk_size(pool, MicropoolSplit::Per(4), 10), 4);
+        assert_eq!(chunk_size(pool, MicropoolSplit::By(0), 10), 10);
+        assert_eq!(chunk_size(pool, MicropoolSplit::By(4), 10), 3);
+        // Three workers plus the calling thread.
+        assert_eq!(chunk_size(pool, MicropoolSplit::ByThreads, 10), 3);
+        assert_eq!(chunk_size(pool, MicropoolSplit::default(), 10), 3);
+        assert_eq!(chunk_size(pool, MicropoolSplit::default(), 2), 1);
+        assert_eq!(chunk_size(pool, MicropoolSplit::default(), 0), 1);
     }
 }
